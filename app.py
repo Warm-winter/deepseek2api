@@ -100,14 +100,51 @@ DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_chall
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 DEEPSEEK_STOP_STREAM_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/stop_stream"
 DEEPSEEK_DELETE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/delete"
+DEEPSEEK_VERSION_URL = f"https://{DEEPSEEK_HOST}/version.txt"
+
+APP_VERSION_DEFAULT = "20241129.1"
+APP_VERSION_REFRESH_INTERVAL = 600
+
+app_version = APP_VERSION_DEFAULT
+
+
+def fetch_app_version():
+    global app_version
+    try:
+        resp = requests.get(
+            DEEPSEEK_VERSION_URL,
+            headers={"Accept": "text/plain", "User-Agent": "DeepSeek/2.0.0 Android/35"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            version = resp.text.strip()
+            if version and not version.startswith("<!"):
+                app_version = version
+                logger.info(f"[fetch_app_version] 获取版本号成功: {app_version}")
+                return
+    except Exception as e:
+        logger.warning(f"[fetch_app_version] 获取版本号失败: {e}")
+    logger.warning(f"[fetch_app_version] 使用默认版本号: {APP_VERSION_DEFAULT}")
+
+
+def app_version_refresh_loop():
+    while True:
+        time.sleep(APP_VERSION_REFRESH_INTERVAL)
+        fetch_app_version()
+
+
+fetch_app_version()
+_refresh_thread = threading.Thread(target=app_version_refresh_loop, daemon=True)
+_refresh_thread.start()
+
 BASE_HEADERS = {
     "Host": "chat.deepseek.com",
-    "User-Agent": "DeepSeek/1.0.13 Android/35",
+    "User-Agent": "DeepSeek/2.0.0 Android/35",
     "Accept": "application/json",
     "Accept-Encoding": "gzip",
     "Content-Type": "application/json",
     "x-client-platform": "android",
-    "x-client-version": "1.3.0-auto-resume",
+    "x-client-version": "2.0.0",
     "x-client-locale": "zh_CN",
     "accept-charset": "UTF-8",
 }
@@ -173,7 +210,12 @@ def login_deepseek_via_account(account):
         raise HTTPException(
             status_code=500, detail="Account login failed: invalid JSON response"
         )
-    # 校验响应数据格式是否正确
+    code = data.get("code")
+    if code == 40005:
+        logger.error(f"[login_deepseek_via_account] 客户端版本过低: {data}")
+        raise HTTPException(
+            status_code=500, detail="Account login failed: CLIENT_VERSION_TOO_LOW, please update headers."
+        )
     if (
         data.get("data") is None
         or data["data"].get("biz_data") is None
@@ -181,7 +223,7 @@ def login_deepseek_via_account(account):
     ):
         logger.error(f"[login_deepseek_via_account] 登录响应格式错误: {data}")
         raise HTTPException(
-            status_code=500, detail="Account login failed: invalid response format"
+            status_code=500, detail=f"Account login failed: invalid response format (code={code}, msg={data.get('msg')})"
         )
     new_token = data["data"]["biz_data"]["user"].get("token")
     if not new_token:
@@ -282,7 +324,7 @@ def determine_mode_and_token(request: Request):
 
 def get_auth_headers(request: Request):
     """返回 DeepSeek 请求所需的公共请求头"""
-    return {**BASE_HEADERS, "authorization": f"Bearer {request.state.deepseek_token}"}
+    return {**BASE_HEADERS, "authorization": f"Bearer {request.state.deepseek_token}", "X-App-Version": app_version}
 
 
 # ----------------------------------------------------------------------
@@ -471,7 +513,8 @@ def create_session(request: Request, max_attempts=3):
             logger.error(f"[create_session] JSON解析异常: {e}")
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
-            session_id = data["data"]["biz_data"]["id"]
+            biz_data = data["data"]["biz_data"]
+            session_id = biz_data.get("id") or biz_data.get("chat_session", {}).get("id")
 
             resp.close()
             return session_id
@@ -1048,108 +1091,112 @@ After calling tools, you will receive the results and can continue the conversat
                                     line = raw_line.decode("utf-8")
                                 except Exception as e:
                                     logger.warning(f"[sse_stream] 解码失败: {e}")
-                                    # 根据当前模式决定错误消息类型
-                                    error_type = "thinking" if ptype == "thinking" else "text"
-                                    busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解码失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
-                                    try:
-                                        busy_content = json.loads(busy_content_str)
-                                        result_queue.put(busy_content)
-                                    except json.JSONDecodeError:
-                                        # 如果JSON解析也失败，创建最基本的错误响应
-                                        result_queue.put({"choices": [{"index": 0, "delta": {"content": "解码失败", "type": "text"}}]})
+                                    result_queue.put({"choices": [{"index": 0, "delta": {"content": "解码失败，请稍候再试", "type": "text"}}]})
                                     result_queue.put(None)
                                     break
                                 if not line:
                                     continue
-                                if line.startswith("data:"):
-                                    data_str = line[5:].strip()
-                                    if data_str == "[DONE]":
-                                        result_queue.put(None)  # 结束信号
-                                        break
-                                    try:
-                                        chunk = json.loads(data_str)
-                                        
-                                        if "response_message_id" in chunk:
-                                            response_message_id = chunk["response_message_id"]
-                                        
-                                        if "v" in chunk:
-                                            v_value = chunk["v"]
-                                            
-                                            # 构造新的 delta 格式的 chunk
-                                            content = ""
-
-                                            if "p" in chunk and chunk.get("p") == "response/status":
-                                                if v_value=='FINISHED':
-                                                    result_queue.put(None)  # 结束信号
-                                                    break
-                                                continue
-                                            
-                                            if "p" in chunk and chunk.get("p") == "response/search_status":
-                                                continue
-                                                
-                                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                                ptype = "thinking"
-                                            elif "p" in chunk and chunk.get("p") == "response/content":
-                                                ptype = "text"
-
-                                            # 处理文本内容
-                                            if isinstance(v_value, str):
-                                                content = v_value
-                                            # 处理数组更新如状态变更
-                                            elif isinstance(v_value, list):
-                                                for item in v_value:
-                                                    if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                        # 最终完成信号
-                                                        result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                                        result_queue.put(None)
-                                                        return
-                                                continue
-                                            
-                                            # 构造兼容原逻辑的 chunk
-                                            unified_chunk = {
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "content": content,
-                                                        "type": ptype
-                                                    }
-                                                }],
-                                                "model": "",
-                                                "chunk_token_usage": len(content) // 4,  # 简单估算token数
-                                                "created": 0,
-                                                "message_id": -1,
-                                                "parent_id": -1
-                                            }
-                    
-                                            result_queue.put(unified_chunk)
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"[sse_stream] 无法解析: {data_str}, 错误: {e}"
-                                        )
-                                        # 根据当前模式决定错误消息类型
-                                        error_type = "thinking" if ptype == "thinking" else "text"
-                                        busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解析失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
-                                        try:
-                                            busy_content = json.loads(busy_content_str)
-                                            result_queue.put(busy_content)
-                                        except json.JSONDecodeError:
-                                            # 如果JSON解析也失败，创建最基本的错误响应
-                                            result_queue.put({"choices": [{"index": 0, "delta": {"content": "解析失败", "type": "text"}}]})
+                                if line.startswith("event:"):
+                                    if "close" in line:
                                         result_queue.put(None)
                                         break
+                                    continue
+                                if not line.startswith("data:"):
+                                    continue
+                                data_str = line[5:].strip()
+                                if not data_str or data_str == "[DONE]":
+                                    result_queue.put(None)
+                                    break
+                                try:
+                                    chunk = json.loads(data_str)
+                                except Exception:
+                                    continue
+
+                                if "response_message_id" in chunk:
+                                    continue
+
+                                if "v" not in chunk:
+                                    continue
+
+                                v_value = chunk["v"]
+                                p_value = chunk.get("p")
+                                o_value = chunk.get("o")
+
+                                if p_value == "response/status" and v_value == "FINISHED":
+                                    result_queue.put(None)
+                                    break
+
+                                if p_value == "response/search_status":
+                                    continue
+
+                                if p_value == "response" and o_value == "BATCH":
+                                    continue
+
+                                if isinstance(v_value, dict) and "response" in v_value:
+                                    response_obj = v_value["response"]
+                                    fragments = response_obj.get("fragments", [])
+                                    for fragment in fragments:
+                                        frag_type = fragment.get("type", "RESPONSE")
+                                        frag_content = fragment.get("content", "")
+                                        if not frag_content:
+                                            continue
+                                        if frag_type in ("THINKING", "THINK"):
+                                            ptype = "thinking"
+                                        else:
+                                            ptype = "text"
+                                        unified_chunk = {
+                                            "choices": [{"index": 0, "delta": {"content": frag_content, "type": ptype}}],
+                                        }
+                                        result_queue.put(unified_chunk)
+                                    continue
+
+                                if p_value and "fragments" in p_value and o_value == "APPEND":
+                                    if isinstance(v_value, list):
+                                        for new_frag in v_value:
+                                            frag_type = new_frag.get("type", "RESPONSE")
+                                            if frag_type in ("THINKING", "THINK"):
+                                                ptype = "thinking"
+                                            else:
+                                                ptype = "text"
+                                            frag_content = new_frag.get("content", "")
+                                            if frag_content:
+                                                unified_chunk = {
+                                                    "choices": [{"index": 0, "delta": {"content": frag_content, "type": ptype}}],
+                                                }
+                                                result_queue.put(unified_chunk)
+                                        continue
+                                    if isinstance(v_value, str):
+                                        if "thinking" in p_value.lower() or ptype == "thinking":
+                                            ptype = "thinking"
+                                        else:
+                                            ptype = "text"
+                                        unified_chunk = {
+                                            "choices": [{"index": 0, "delta": {"content": v_value, "type": ptype}}],
+                                        }
+                                        result_queue.put(unified_chunk)
+                                    continue
+
+                                if isinstance(v_value, str) and p_value is None:
+                                    unified_chunk = {
+                                        "choices": [{"index": 0, "delta": {"content": v_value, "type": ptype}}],
+                                    }
+                                    result_queue.put(unified_chunk)
+                                    continue
+
+                                if p_value == "response/thinking_content":
+                                    ptype = "thinking"
+                                elif p_value == "response/content":
+                                    ptype = "text"
+
+                                if isinstance(v_value, str) and p_value in ("response/content", "response/thinking_content"):
+                                    unified_chunk = {
+                                        "choices": [{"index": 0, "delta": {"content": v_value, "type": ptype}}],
+                                    }
+                                    result_queue.put(unified_chunk)
                         except Exception as e:
                             logger.warning(f"[sse_stream] 错误: {e}")
-                            # 创建基本的错误响应，不依赖JSON解析
-                            try:
-                                error_response = {"choices": [{"index": 0, "delta": {"content": "服务器错误，请稍候再试", "type": "text"}}]}
-                                result_queue.put(error_response)
-                            except Exception:
-                                # 最终备选方案
-                                pass
+                            result_queue.put({"choices": [{"index": 0, "delta": {"content": "服务器错误，请稍候再试", "type": "text"}}]})
                             result_queue.put(None)
-                            # raise HTTPException(
-                                # status_code=500, detail="Server is error."
-                            # )
                         finally:
                             deepseek_resp.close()
 
@@ -1336,8 +1383,7 @@ After calling tools, you will receive the results and can continue the conversat
                         try:
                             line = raw_line.decode("utf-8")
                         except Exception as e:
-                            logger.warning(f"[chat_completions] 解码失败: {e}")
-                            # 根据当前处理类型添加错误消息
+                            logger.warning(f"[collect_data] 解码失败: {e}")
                             if ptype == "thinking":
                                 think_list.append('解码失败，请稍候再试')
                             else:
@@ -1346,107 +1392,111 @@ After calling tools, you will receive the results and can continue the conversat
                             break
                         if not line:
                             continue
-                        if line.startswith("data:"):
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
+                        if line.startswith("event:"):
+                            if "close" in line:
                                 data_queue.put(None)
                                 break
-                            try:
-                                chunk = json.loads(data_str)
-            
-                                # 提取 v 字段
-                                if "v" in chunk:
-                                    v_value = chunk["v"]
-                                    
-                                    if "p" in chunk and chunk.get("p") == "response/status":
-                                        if v_value=='FINISHED':
-                                            data_queue.put(None)  # 结束信号
-                                            break
-                                        continue
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            data_queue.put(None)
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except Exception:
+                            continue
 
-                                    if "p" in chunk and chunk.get("p") == "response/search_status":
-                                        continue
-                                                
-                                    if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                        ptype = "thinking"
-                                    elif "p" in chunk and chunk.get("p") == "response/content":
-                                        ptype = "text"
-            
-                                    # 处理字符串形式的 v 值（即文本内容）
-                                    if isinstance(v_value, str):
-                                        if search_enabled and v_value.startswith("[citation:"):
-                                            continue  # 跳过 citation 内容
-                                        if ptype == "thinking":
-                                            think_list.append(v_value)
-                                        else:
-                                            text_list.append(v_value)
-            
-                                    # 处理数组更新如状态变更
-                                    elif isinstance(v_value, list):
-                                        for item in v_value:
-                                            if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                # 构建最终结果
-                                                final_reasoning = "".join(think_list)
-                                                final_content = "".join(text_list)
-                                                
-                                                # 检测 tool_calls
-                                                tool_calls_detected = None
-                                                if has_tools:
-                                                    tool_calls_detected, final_content = detect_and_parse_tool_calls(final_content)
-                                                
-                                                prompt_tokens = len(final_prompt) // 4  # 简单估算token数
-                                                reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
-                                                completion_tokens = len(final_content) // 4  # 简单估算token数
-                                                
-                                                # 构建 message 对象
-                                                message_obj = {
-                                                    "role": "assistant",
-                                                    "content": final_content,
-                                                    "reasoning_content": final_reasoning,
-                                                }
-                                                
-                                                # 如果检测到 tool_calls，添加到 message
-                                                finish_reason = "stop"
-                                                if tool_calls_detected:
-                                                    message_obj["tool_calls"] = tool_calls_detected
-                                                    finish_reason = "tool_calls"
-                                                
-                                                result = {
-                                                    "id": completion_id,
-                                                    "object": "chat.completion",
-                                                    "created": created_time,
-                                                    "model": model,
-                                                    "choices": [
-                                                        {
-                                                            "index": 0,
-                                                            "message": message_obj,
-                                                            "finish_reason": finish_reason,
-                                                        }
-                                                    ],
-                                                    "usage": {
-                                                        "prompt_tokens": prompt_tokens,
-                                                        "completion_tokens": reasoning_tokens + completion_tokens,
-                                                        "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                                                        "completion_tokens_details": {
-                                                            "reasoning_tokens": reasoning_tokens
-                                                        },
-                                                    },
-                                                }
-                                                data_queue.put("DONE")
-                                                return  # 提前返回，结束函数
-            
-                            except Exception as e:
-                                logger.warning(f"[collect_data] 无法解析: {data_str}, 错误: {e}")
-                                # 根据当前处理类型添加错误消息
-                                if ptype == "thinking":
-                                    think_list.append('解析失败，请稍候再试')
+                        if "response_message_id" in chunk:
+                            continue
+                        if "v" not in chunk:
+                            continue
+
+                        v_value = chunk["v"]
+                        p_value = chunk.get("p")
+                        o_value = chunk.get("o")
+
+                        if p_value == "response/status" and v_value == "FINISHED":
+                            data_queue.put(None)
+                            break
+
+                        if p_value == "response/search_status":
+                            continue
+
+                        if p_value == "response" and o_value == "BATCH":
+                            continue
+
+                        if isinstance(v_value, dict) and "response" in v_value:
+                            response_obj = v_value["response"]
+                            fragments = response_obj.get("fragments", [])
+                            for fragment in fragments:
+                                frag_type = fragment.get("type", "RESPONSE")
+                                frag_content = fragment.get("content", "")
+                                if not frag_content:
+                                    continue
+                                if frag_type in ("THINKING", "THINK"):
+                                    ptype = "thinking"
+                                    think_list.append(frag_content)
                                 else:
-                                    text_list.append('解析失败，请稍候再试')
-                                data_queue.put(None)
-                                break
+                                    ptype = "text"
+                                    if search_enabled and frag_content.startswith("[citation:"):
+                                        continue
+                                    text_list.append(frag_content)
+                            continue
+
+                        if p_value and "fragments" in p_value and o_value == "APPEND":
+                            if isinstance(v_value, list):
+                                for new_frag in v_value:
+                                    frag_type = new_frag.get("type", "RESPONSE")
+                                    if frag_type in ("THINKING", "THINK"):
+                                        ptype = "thinking"
+                                    else:
+                                        ptype = "text"
+                                    frag_content = new_frag.get("content", "")
+                                    if frag_content:
+                                        if ptype == "thinking":
+                                            think_list.append(frag_content)
+                                        else:
+                                            if search_enabled and frag_content.startswith("[citation:"):
+                                                continue
+                                            text_list.append(frag_content)
+                                continue
+                            if isinstance(v_value, str):
+                                if "thinking" in p_value.lower() or ptype == "thinking":
+                                    ptype = "thinking"
+                                    think_list.append(v_value)
+                                else:
+                                    ptype = "text"
+                                    if search_enabled and v_value.startswith("[citation:"):
+                                        continue
+                                    text_list.append(v_value)
+                            continue
+
+                        if isinstance(v_value, str) and p_value is None:
+                            if ptype == "thinking":
+                                think_list.append(v_value)
+                            else:
+                                if search_enabled and v_value.startswith("[citation:"):
+                                    continue
+                                text_list.append(v_value)
+                            continue
+
+                        if p_value == "response/thinking_content":
+                            ptype = "thinking"
+                        elif p_value == "response/content":
+                            ptype = "text"
+
+                        if isinstance(v_value, str) and p_value in ("response/content", "response/thinking_content"):
+                            if ptype == "thinking":
+                                think_list.append(v_value)
+                            else:
+                                if search_enabled and v_value.startswith("[citation:"):
+                                    continue
+                                text_list.append(v_value)
+
                 except Exception as e:
                     logger.warning(f"[collect_data] 错误: {e}")
-                    # 根据当前处理类型添加错误消息
                     if ptype == "thinking":
                         think_list.append('处理失败，请稍候再试')
                     else:
@@ -1682,7 +1732,7 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                     full_response_text = ""
                     response_completed = False
                     
-                    # 解析DeepSeek流式响应
+                    ptype = "text"
                     for line in deepseek_resp.iter_lines():
                         if not line:
                             continue
@@ -1690,25 +1740,80 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                             line_str = line.decode('utf-8')
                         except Exception:
                             continue
-                            
-                        if line_str.startswith('data:'):
-                            data_str = line_str[5:].strip()
-                            if data_str == '[DONE]':
+
+                        if line_str.startswith('event:'):
+                            if 'close' in line_str:
                                 response_completed = True
                                 break
-                                
-                            try:
-                                chunk = json.loads(data_str)
-                                if "v" in chunk and isinstance(chunk["v"], str):
-                                    full_response_text += chunk["v"]
-                                elif "v" in chunk and isinstance(chunk["v"], list):
-                                    # 检查完成状态
-                                    for item in chunk["v"]:
-                                        if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                            response_completed = True
-                                            break
-                            except (json.JSONDecodeError, KeyError):
+                            continue
+                        if not line_str.startswith('data:'):
+                            continue
+                        data_str = line_str[5:].strip()
+                        if not data_str or data_str == '[DONE]':
+                            response_completed = True
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+
+                        if 'response_message_id' in chunk or 'v' not in chunk:
+                            continue
+
+                        v_value = chunk['v']
+                        p_value = chunk.get('p')
+                        o_value = chunk.get('o')
+
+                        if p_value == 'response/status' and v_value == 'FINISHED':
+                            response_completed = True
+                            break
+                        if p_value == 'response/search_status':
+                            continue
+                        if p_value == 'response' and o_value == 'BATCH':
+                            continue
+
+                        if isinstance(v_value, dict) and 'response' in v_value:
+                            fragments = v_value['response'].get('fragments', [])
+                            for frag in fragments:
+                                frag_type = frag.get('type', 'RESPONSE')
+                                frag_content = frag.get('content', '')
+                                if not frag_content:
+                                    continue
+                                if frag_type in ('THINKING', 'THINK'):
+                                    ptype = 'thinking'
+                                else:
+                                    ptype = 'text'
+                                    full_response_text += frag_content
+                            continue
+
+                        if p_value and 'fragments' in p_value and o_value == 'APPEND':
+                            if isinstance(v_value, list):
+                                for nf in v_value:
+                                    ft = nf.get('type', 'RESPONSE')
+                                    if ft in ('THINKING', 'THINK'):
+                                        ptype = 'thinking'
+                                    else:
+                                        ptype = 'text'
+                                    fc = nf.get('content', '')
+                                    if fc and ptype == 'text':
+                                        full_response_text += fc
                                 continue
+                            if isinstance(v_value, str):
+                                if 'thinking' in p_value.lower() or ptype == 'thinking':
+                                    ptype = 'thinking'
+                                else:
+                                    ptype = 'text'
+                                    full_response_text += v_value
+                            continue
+
+                        if isinstance(v_value, str) and p_value is None:
+                            if ptype == 'text':
+                                full_response_text += v_value
+                            continue
+
+                        if isinstance(v_value, str) and p_value in ('response/content',):
+                            full_response_text += v_value
                     
                     # 现在一次性发送Claude格式的事件
                     
@@ -2283,7 +2388,7 @@ async def claude_stop_stream(request: Request):
 # ----------------------------------------------------------------------
 @app.get("/")
 def index(request: Request):
-    return templates.TemplateResponse("welcome.html", {"request": request})
+    return templates.TemplateResponse(request, "welcome.html", {"request": request})
 
 
 # ----------------------------------------------------------------------

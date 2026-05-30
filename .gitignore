@@ -1,2 +1,4 @@
 *.bak
 config.json
+deepseek2api-local.tar.gz
+.trae/
